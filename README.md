@@ -1,3 +1,5 @@
+Read the accompanying blog post for more info: https://specterops.io/blog/2026/01/30/weaponizing-whitelists-an-azure-blob-storage-mythic-c2-profile/
+
 # Azure Blob Storage C2 Profile
 
 A [Mythic](https://github.com/its-a-feature/Mythic) C2 Profile that uses Azure Blob Storage for command and control communication with **per-agent container isolation**.
