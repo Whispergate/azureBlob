@@ -2,6 +2,7 @@ from mythic_container.C2ProfileBase import *
 from pathlib import Path
 from azure.storage.blob import BlobServiceClient, generate_container_sas, ContainerSasPermissions
 from datetime import datetime
+import json
 
 async def generate_config(input: C2OtherServiceRPCMessage) -> C2OtherServiceRPCMessageResponse:
     # prev pulling from payload build parameters
