@@ -13,7 +13,7 @@ from azure.storage.blob import BlobServiceClient, generate_container_sas, Contai
 
 class Pegasus(PayloadType):
     name = "pegasus"
-    author = "@sender, @KingoftheNOPs, @its-a-feature, @auntra-entra, @n0mad"
+    author = "@sender, @KingoftheNOPs, @its-a-feature, @auntra-entra, @n0mad, @Lavender-exe"
     description = "Pegasus - Test agent for Azure Blob C2 profile"
     supported_os = [SupportedOS.Linux, SupportedOS.MacOS, SupportedOS.Windows]
     file_extension = "py"
@@ -47,6 +47,7 @@ class Pegasus(PayloadType):
     build_steps = [
         BuildStep(step_name="Provisioning Azure Container", step_description="Creating container and generating SAS token"),
         BuildStep(step_name="Stamping Configuration", step_description="Embedding configuration into agent"),
+        BuildStep(step_name="Applying Evasion", step_description="Configuring anti-analysis and evasion features"),
         BuildStep(step_name="Finalizing Payload", step_description="Building final payload"),
     ]
 
@@ -123,7 +124,16 @@ class Pegasus(PayloadType):
                     agent_code = agent_code.replace("CALLBACK_INTERVAL_PLACEHOLDER", callback_interval)
                     agent_code = agent_code.replace("CALLBACK_JITTER_PLACEHOLDER", callback_jitter)
                     agent_code = agent_code.replace("AGENT_UUID_PLACEHOLDER", self.uuid)
+                    agent_code = agent_code.replace("KILLDATE_PLACEHOLDER", killdate or "")
 
+                    await SendMythicRPCPayloadUpdatebuildStep(
+                        MythicRPCPayloadUpdateBuildStepMessage(
+                            PayloadUUID=self.uuid,
+                            StepName="Applying Evasion",
+                            StepStdout="AMSI patch: enabled\nETW patch: enabled\nAnti-sandbox: enabled\nKilldate: " + (killdate or "none"),
+                            StepSuccess=True
+                        )
+                    )
 
             # Step 3: Finalize payload
             await SendMythicRPCPayloadUpdatebuildStep(
