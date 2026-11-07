@@ -165,28 +165,43 @@ class Pegasus(PayloadType):
 
             if target_os == "Windows":
                 win_python = "/opt/win-python/python.exe"
-                if not os.path.exists(win_python):
-                    return {
-                        "success": False,
-                        "error": "Windows cross-compilation unavailable: "
-                                 "/opt/win-python/python.exe not found.\n"
-                                 "Rebuild the Pegasus container image to "
-                                 "install Wine + Windows Python.",
-                    }
-                wine_agent = "Z:" + agent_path.replace("/", "\\")
-                wine_dist = "Z:" + dist_dir.replace("/", "\\")
-                wine_work = "Z:" + work_dir.replace("/", "\\")
-                wine_spec = "Z:" + build_dir.replace("/", "\\")
-                cmd = [
-                    "wine64", win_python, "-m", "PyInstaller",
-                    "--onefile", "--noconsole", "--clean",
-                    "--name", "pegasus",
-                    "--distpath", wine_dist,
-                    "--workpath", wine_work,
-                    "--specpath", wine_spec,
-                    wine_agent,
-                ]
-                exe_name = "pegasus.exe"
+                wine_available = shutil.which("wine64") is not None
+                if not os.path.exists(win_python) or not wine_available:
+                    # Wine cross-compilation not available — fall back to
+                    # native PyInstaller producing a Linux ELF with a warning
+                    cmd = [
+                        "pyinstaller",
+                        "--onefile", "--noconsole", "--clean", "--strip",
+                        "--name", "pegasus",
+                        "--distpath", dist_dir,
+                        "--workpath", work_dir,
+                        "--specpath", build_dir,
+                        agent_path,
+                    ]
+                    exe_name = "pegasus"
+                    fallback_warning = (
+                        "WARNING: Wine cross-compilation not available "
+                        "(wine64 or /opt/win-python/python.exe missing). "
+                        "Built a LINUX ELF binary instead. To get a "
+                        "Windows .exe, install wine64 + Windows Python "
+                        "in the Pegasus container.\n"
+                    )
+                else:
+                    wine_agent = "Z:" + agent_path.replace("/", "\\")
+                    wine_dist = "Z:" + dist_dir.replace("/", "\\")
+                    wine_work = "Z:" + work_dir.replace("/", "\\")
+                    wine_spec = "Z:" + build_dir.replace("/", "\\")
+                    cmd = [
+                        "wine64", win_python, "-m", "PyInstaller",
+                        "--onefile", "--noconsole", "--clean",
+                        "--name", "pegasus",
+                        "--distpath", wine_dist,
+                        "--workpath", wine_work,
+                        "--specpath", wine_spec,
+                        wine_agent,
+                    ]
+                    exe_name = "pegasus.exe"
+                    fallback_warning = ""
             else:
                 cmd = [
                     "pyinstaller",
@@ -198,6 +213,7 @@ class Pegasus(PayloadType):
                     agent_path,
                 ]
                 exe_name = "pegasus"
+                fallback_warning = ""
 
             env = {**os.environ, "WINEDEBUG": "-all"}
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
@@ -218,7 +234,7 @@ class Pegasus(PayloadType):
             return {
                 "success": True,
                 "payload": payload_bytes,
-                "message": f"Compiled {exe_name} for {target_os} ({size_mb:.1f} MB, PyInstaller --onefile)",
+                "message": f"{fallback_warning}Compiled {exe_name} for {target_os} ({size_mb:.1f} MB, PyInstaller --onefile)",
             }
 
         except subprocess.TimeoutExpired:
